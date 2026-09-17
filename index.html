@@ -67,9 +67,11 @@
     display:flex;
     justify-content:space-between;
     align-items:center;
-    margin-bottom:18px;
+    margin-bottom:12px;
     font-size:12px;
     color:var(--sub);
+    flex-wrap:wrap;
+    gap:8px;
   }
   .sync-status{
     display:flex;
@@ -84,6 +86,7 @@
   .dot.on{background:var(--good);}
   .dot.busy{background:var(--gold);}
   .dot.err{background:var(--bad);}
+  .dot.off{background:#999;}
   .signin-btn{
     background:var(--ink);
     color:var(--card);
@@ -97,19 +100,24 @@
   }
   .signin-btn:hover{background:var(--ribbon);}
   .signin-btn[disabled]{opacity:.5; cursor:default;}
-  .gate{
+  .offline-banner{
     width:100%;
     max-width:560px;
-    background:var(--card);
-    border:1px solid var(--paper-edge);
-    border-radius:3px;
-    padding:40px 30px;
-    text-align:center;
-    color:var(--sub);
-    font-size:14px;
-    line-height:1.8;
+    background:var(--good-bg);
+    border:1px solid var(--good);
+    color:var(--good);
+    border-radius:2px;
+    padding:8px 12px;
+    font-size:12px;
+    margin-bottom:14px;
+    display:none;
   }
-  .gate strong{color:var(--ink); display:block; margin-bottom:8px; font-family:'Shippori Mincho',serif; font-size:16px;}
+  .offline-banner.shown{display:block;}
+  .offline-banner.offline-mode{
+    background:#EFEAE0;
+    border-color:var(--sub);
+    color:var(--sub);
+  }
   .stats-row{
     width:100%;
     max-width:560px;
@@ -266,16 +274,6 @@
     padding:4px;
     font-family:'Noto Serif JP',serif;
   }
-  .done{
-    text-align:center;
-    padding:60px 20px;
-    color:var(--sub);
-  }
-  .done h2{
-    font-family:'Shippori Mincho',serif;
-    color:var(--ink);
-    font-size:20px;
-  }
   @media (prefers-color-scheme: dark){
     :root{
       --paper:#20232B;
@@ -301,16 +299,12 @@
     <span class="count" id="deck-count"></span>
   </div>
   <div class="sync-row">
-    <span class="sync-status"><span class="dot" id="sync-dot"></span><span id="sync-label">未サインイン</span></span>
+    <span class="sync-status"><span class="dot" id="sync-dot"></span><span id="sync-label">端末に保存済み</span></span>
     <button class="signin-btn" id="signin-btn" type="button" disabled>読み込み中…</button>
   </div>
+  <div class="offline-banner" id="offline-banner"></div>
 
-  <div class="gate" id="gate">
-    <strong>Googleでサインインしてください</strong>
-    進捗はあなたのGoogleドライブ（アプリ専用の非公開領域）に自動で保存されます。<br>Claude側には何も保存されません。
-  </div>
-
-  <div id="quiz-area" style="display:none; width:100%; max-width:560px;">
+  <div id="quiz-area" style="width:100%; max-width:560px;">
     <div class="stats-row">
       <div class="stat"><span class="n" id="stat-new">0</span><span class="l">未習</span></div>
       <div class="stat"><span class="n" id="stat-learning">0</span><span class="l">学習中</span></div>
@@ -334,12 +328,12 @@ const ENTRIES = [{"word": "banter", "defs": ["[名] [Ｕ] «人との/…の間�
 const CLIENT_ID = "194202080386-ehr0548ompl8s3lum4n8dsp8vnae5uk2.apps.googleusercontent.com";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.appdata";
 const PROGRESS_FILENAME = "wisdom-review-progress.json";
+const LOCAL_KEY = "wisdom-review-progress-local";
 </script>
 <script>
 (function(){
-  const gate = document.getElementById('gate');
-  const quizArea = document.getElementById('quiz-area');
   const stage = document.getElementById('stage');
+  const offlineBanner = document.getElementById('offline-banner');
   const els = {
     deckCount: document.getElementById('deck-count'),
     deckProgress: document.getElementById('deck-progress'),
@@ -358,16 +352,48 @@ const PROGRESS_FILENAME = "wisdom-review-progress.json";
   els.deckCount.textContent = ENTRIES.length + ' 語';
 
   const todayStr = new Date().toISOString().slice(0,10);
-  let progress = { boxes:{}, todayCount:0, todayDate: todayStr, seenCount:0 };
+
+  function freshProgress(){
+    return { boxes:{}, todayCount:0, todayDate: todayStr, seenCount:0, updatedAt: 0 };
+  }
+
+  let progress = loadLocal() || freshProgress();
   let currentIndex = -1;
   let accessToken = null;
   let driveFileId = null;
   let tokenClient = null;
   let saveTimer = null;
+  let pendingSync = false;
+
+  // ---- local (always-on) persistence ----
+
+  function saveLocal(p){
+    try{ localStorage.setItem(LOCAL_KEY, JSON.stringify(p)); }catch(e){}
+  }
+
+  function loadLocal(){
+    try{
+      const raw = localStorage.getItem(LOCAL_KEY);
+      if(raw) return JSON.parse(raw);
+    }catch(e){}
+    return null;
+  }
 
   function setSyncState(state, label){
     els.syncDot.className = 'dot' + (state ? ' ' + state : '');
     els.syncLabel.textContent = label;
+  }
+
+  function updateOfflineBanner(){
+    if(!navigator.onLine){
+      offlineBanner.textContent = 'オフラインです。進捗はこの端末に保存され、オンラインに戻ったときに自動で同期されます。';
+      offlineBanner.className = 'offline-banner shown offline-mode';
+    } else if(pendingSync){
+      offlineBanner.textContent = '未同期の変更があります。まもなく自動で同期します。';
+      offlineBanner.className = 'offline-banner shown';
+    } else {
+      offlineBanner.className = 'offline-banner';
+    }
   }
 
   function boxOf(word){ return progress.boxes[word] || 0; }
@@ -459,14 +485,39 @@ const PROGRESS_FILENAME = "wisdom-review-progress.json";
     }
     progress.todayCount += 1;
     progress.seenCount += 1;
+    progress.updatedAt = Date.now();
+    saveLocal(progress);
     updateStats();
-    queueSave();
+    pendingSync = true;
+    updateOfflineBanner();
+    queueSync();
     nextCard();
   }
 
   function nextCard(){
     currentIndex = pickIndex();
     renderCard();
+  }
+
+  // ---- merge helper: combine local + remote without losing progress made on either side ----
+
+  function mergeProgress(a, b){
+    if(!a) return b || freshProgress();
+    if(!b) return a;
+    const merged = freshProgress();
+    merged.boxes = Object.assign({}, a.boxes, b.boxes);
+    Object.keys(merged.boxes).forEach(w=>{
+      const av = (a.boxes && a.boxes[w]) || 0;
+      const bv = (b.boxes && b.boxes[w]) || 0;
+      merged.boxes[w] = Math.max(av, bv);
+    });
+    merged.seenCount = Math.max(a.seenCount||0, b.seenCount||0);
+    // keep today's count from whichever record is for today and more recent
+    const newer = (a.updatedAt||0) >= (b.updatedAt||0) ? a : b;
+    merged.todayDate = newer.todayDate;
+    merged.todayCount = newer.todayDate === todayStr ? newer.todayCount : 0;
+    merged.updatedAt = Date.now();
+    return merged;
   }
 
   // ---- Google Drive (appDataFolder) sync ----
@@ -489,69 +540,77 @@ const PROGRESS_FILENAME = "wisdom-review-progress.json";
     return null;
   }
 
-  async function loadFromDrive(){
-    setSyncState('busy', '読み込み中…');
+  async function fetchRemoteProgress(){
     driveFileId = await findProgressFile();
-    if(driveFileId){
-      const res = await fetch('https://www.googleapis.com/drive/v3/files/' + driveFileId + '?alt=media', {
-        headers: driveHeaders()
-      });
-      if(res.ok){
-        const parsed = await res.json();
-        if(parsed && typeof parsed.boxes === 'object'){
-          progress = Object.assign({ boxes:{}, todayCount:0, todayDate: todayStr, seenCount:0 }, parsed);
-          if(progress.todayDate !== todayStr){
-            progress.todayDate = todayStr;
-            progress.todayCount = 0;
-          }
-        }
-      }
-    }
-    setSyncState('on', 'ドライブと同期済み');
+    if(!driveFileId) return null;
+    const res = await fetch('https://www.googleapis.com/drive/v3/files/' + driveFileId + '?alt=media', {
+      headers: driveHeaders()
+    });
+    if(!res.ok) return null;
+    const parsed = await res.json();
+    if(parsed && typeof parsed.boxes === 'object') return parsed;
+    return null;
   }
 
-  async function saveToDrive(){
-    if(!accessToken) return;
-    setSyncState('busy', '保存中…');
+  async function pushToDrive(p){
+    const body = JSON.stringify(p);
+    if(!driveFileId){
+      const metadata = { name: PROGRESS_FILENAME, parents: ['appDataFolder'] };
+      const boundary = 'wisdomboundary';
+      const multipartBody =
+        '--' + boundary + '\r\n' +
+        'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+        JSON.stringify(metadata) + '\r\n' +
+        '--' + boundary + '\r\n' +
+        'Content-Type: application/json\r\n\r\n' +
+        body + '\r\n' +
+        '--' + boundary + '--';
+      const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
+        method: 'POST',
+        headers: driveHeaders({ 'Content-Type': 'multipart/related; boundary=' + boundary }),
+        body: multipartBody
+      });
+      if(!res.ok) throw new Error('create failed: ' + res.status);
+      const data = await res.json();
+      driveFileId = data.id;
+    } else {
+      const res = await fetch('https://www.googleapis.com/upload/drive/v3/files/' + driveFileId + '?uploadType=media', {
+        method: 'PATCH',
+        headers: driveHeaders({ 'Content-Type': 'application/json' }),
+        body: body
+      });
+      if(!res.ok) throw new Error('update failed: ' + res.status);
+    }
+  }
+
+  async function syncNow(){
+    if(!accessToken || !navigator.onLine) return;
+    setSyncState('busy', '同期中…');
     try{
-      const body = JSON.stringify(progress);
-      if(!driveFileId){
-        const metadata = { name: PROGRESS_FILENAME, parents: ['appDataFolder'] };
-        const boundary = 'wisdomboundary';
-        const multipartBody =
-          '--' + boundary + '\r\n' +
-          'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
-          JSON.stringify(metadata) + '\r\n' +
-          '--' + boundary + '\r\n' +
-          'Content-Type: application/json\r\n\r\n' +
-          body + '\r\n' +
-          '--' + boundary + '--';
-        const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
-          method: 'POST',
-          headers: driveHeaders({ 'Content-Type': 'multipart/related; boundary=' + boundary }),
-          body: multipartBody
-        });
-        if(!res.ok) throw new Error('create failed: ' + res.status);
-        const data = await res.json();
-        driveFileId = data.id;
-      } else {
-        const res = await fetch('https://www.googleapis.com/upload/drive/v3/files/' + driveFileId + '?uploadType=media', {
-          method: 'PATCH',
-          headers: driveHeaders({ 'Content-Type': 'application/json' }),
-          body: body
-        });
-        if(!res.ok) throw new Error('update failed: ' + res.status);
-      }
+      const remote = await fetchRemoteProgress();
+      const merged = mergeProgress(progress, remote);
+      progress = merged;
+      saveLocal(progress);
+      updateStats();
+      renderCurrentPromptIfNeeded();
+      await pushToDrive(progress);
+      pendingSync = false;
+      updateOfflineBanner();
       setSyncState('on', 'ドライブと同期済み');
     }catch(e){
-      setSyncState('err', '保存に失敗しました');
+      setSyncState('err', '同期に失敗しました');
     }
   }
 
-  function queueSave(){
+  function renderCurrentPromptIfNeeded(){
+    // stats already reflect merged progress; card content (word/defs) unaffected by merge
+  }
+
+  function queueSync(){
+    if(!accessToken || !navigator.onLine) return;
     setSyncState('busy', '保存待ち…');
     if(saveTimer) clearTimeout(saveTimer);
-    saveTimer = setTimeout(saveToDrive, 600);
+    saveTimer = setTimeout(syncNow, 800);
   }
 
   // ---- Auth ----
@@ -559,24 +618,18 @@ const PROGRESS_FILENAME = "wisdom-review-progress.json";
   function onSignedIn(){
     els.signinBtn.textContent = 'サインイン済み';
     els.signinBtn.disabled = true;
-    loadFromDrive().then(()=>{
-      gate.style.display = 'none';
-      quizArea.style.display = 'block';
-      updateStats();
-      nextCard();
-    }).catch(()=>{
-      setSyncState('err', '読み込みに失敗しました');
-      gate.style.display = 'none';
-      quizArea.style.display = 'block';
-      updateStats();
-      nextCard();
-    });
+    syncNow();
   }
 
   function initAuth(){
     if(typeof google === 'undefined' || !google.accounts){
-      els.signinBtn.textContent = '読み込み中…';
-      setTimeout(initAuth, 300);
+      if(navigator.onLine){
+        els.signinBtn.textContent = '読み込み中…';
+        setTimeout(initAuth, 500);
+      } else {
+        els.signinBtn.textContent = 'オフライン';
+        els.signinBtn.disabled = true;
+      }
       return;
     }
     tokenClient = google.accounts.oauth2.initTokenClient({
@@ -597,6 +650,13 @@ const PROGRESS_FILENAME = "wisdom-review-progress.json";
       tokenClient.requestAccessToken({ prompt: accessToken ? '' : 'consent' });
     });
   }
+
+  window.addEventListener('online', ()=>{
+    updateOfflineBanner();
+    if(accessToken) syncNow();
+    else if(!tokenClient) initAuth();
+  });
+  window.addEventListener('offline', updateOfflineBanner);
 
   els.exportBtn.addEventListener('click', ()=>{
     const payload = JSON.stringify(progress, null, 2);
@@ -624,15 +684,14 @@ const PROGRESS_FILENAME = "wisdom-review-progress.json";
         alert('このファイルは進捗データとして読み込めませんでした。');
         return;
       }
-      progress = Object.assign({ boxes:{}, todayCount:0, todayDate: todayStr, seenCount:0 }, parsed);
-      if(progress.todayDate !== todayStr){
-        progress.todayDate = todayStr;
-        progress.todayCount = 0;
-      }
+      progress = mergeProgress(progress, Object.assign(freshProgress(), parsed, {updatedAt: Date.now()}));
+      saveLocal(progress);
       updateStats();
       nextCard();
-      queueSave();
-      alert('進捗を読み込み、ドライブへの保存をキューに入れました。');
+      pendingSync = true;
+      updateOfflineBanner();
+      queueSync();
+      alert('進捗を読み込みました（既存の記録とマージしました）。');
     }catch(e){
       alert('ファイルの読み込みに失敗しました。');
     }
@@ -640,13 +699,20 @@ const PROGRESS_FILENAME = "wisdom-review-progress.json";
   });
 
   els.resetBtn.addEventListener('click', ()=>{
-    if(!confirm('進捗をすべてリセットしますか？（ドライブ上のデータも上書きされます）')) return;
-    progress = { boxes:{}, todayCount:0, todayDate: todayStr, seenCount:0 };
+    if(!confirm('進捗をすべてリセットしますか？（この端末とドライブ上のデータも上書きされます）')) return;
+    progress = freshProgress();
+    saveLocal(progress);
     updateStats();
     nextCard();
-    queueSave();
+    pendingSync = true;
+    updateOfflineBanner();
+    queueSync();
   });
 
+  // ---- boot: quiz starts immediately from local data, auth/sync happen in background ----
+  updateStats();
+  nextCard();
+  updateOfflineBanner();
   initAuth();
 })();
 </script>
